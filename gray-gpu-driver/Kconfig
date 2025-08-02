@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config GRAY_GPU
+	tristate "Gray GPU simple driver for learning"
+	depends on PCI
+	help
+	  Simple GPU driver for learning GPU driver development.
+	  
+	  This creates a basic character device driver that can bind to
+	  GPU devices (1234:1111 or 1122:1122) for educational purposes.
+	  Start with this before moving to DRM/KMS complexity.
+	  
+	  Say Y or M if you want to experiment with GPU driver development.
+	  
+	  To compile this driver as a module, choose M here.
