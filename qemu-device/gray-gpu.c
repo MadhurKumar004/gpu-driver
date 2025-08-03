@@ -5,6 +5,7 @@
 #include "qom/object.h"
 #include "hw/pci/pci_device.h"
 #include "ui/console.h"
+#include <stdint.h>
 
 #define TYPE_GRAY_GPU "gray-gpu"
 OBJECT_DECLARE_SIMPLE_TYPE(GrayGPUState, GRAY_GPU);
@@ -14,6 +15,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(GrayGPUState, GRAY_GPU);
 
 #define GRAY_GPU_VRAM_SIZE      (16 * MiB) //16 MB VRAM
 #define GRAY_GPU_REG_SIZE       (4 * KiB)  // 4 KB registers
+                                           
+#define CURSOR_SIZE         64
+#define CURSOR_DATA_SIZE    (CURSOR_SIZE * CURSOR_SIZE * 4)
 
 //Register offset
 #define REG_DEVICE_ID       0x00    /* Device identification */
@@ -25,6 +29,21 @@ OBJECT_DECLARE_SIMPLE_TYPE(GrayGPUState, GRAY_GPU);
 #define REG_FB_BPP          0x18    /* Bits per pixel */
 #define REG_FB_ENABLE       0x1C    /* Framebuffer enable */
 #define REG_FB_PITCH        0x20    /* Framebuffer pitch/stride */
+#define REG_CURSOR_X        0x24    /* Cursor X position */
+#define REG_CURSOR_Y        0x28    /* Cursor Y position */
+#define REG_CURSOR_ENABLE   0x2C    /* Cursor enable */
+#define REG_CURSOR_HOTSPOT_X 0x30   /* Cursor hotspot X */
+#define REG_CURSOR_HOTSPOT_Y 0x34   /* Cursor hotspot Y */
+#define REG_CURSOR_UPLOAD   0x38    /* Cursor data upload */
+
+//Multiple framebuffer and page flipping registers
+#define REG_FB_COUNT        0x3C    //Number of framebuffer
+#define REG_FB_CURRENT      0x40    //Currently displayed framebuffer
+#define REG_FB_NEXT         0x44    //Next framebuffer to display
+#define REG_PAGE_FLIP       0x48    //Trigger page flip
+#define REG_FLIP_PENDING    0x4C    //Page flip in progress
+#define REG_VBLANK_COUNT    0x50    //Vblank counter
+
 
 //Contorl register bit
 #define CTRL_RESET      (1 << 0)
@@ -33,6 +52,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(GrayGPUState, GRAY_GPU);
 //Status register bit 
 #define STATUS_READY    (1 << 0)
 #define STATUS_VBLANK   (1 << 1)
+#define STATUS_CURSOR_LOADED    (1 << 2) //cursor image loaded
+
 
 typedef struct GrayGPUState
 {
@@ -52,6 +73,23 @@ typedef struct GrayGPUState
     uint32_t fb_bpp;
     uint32_t fb_enable;
     uint32_t fb_pitch;
+
+    //Mutliple framebuffer state
+    uint32_t fb_count;
+    uint32_t fb_current;
+    uint32_t fb_next;
+    uint32_t flip_pending;
+    uint32_t vblank_count;
+    uint32_t fb_addresses[4];
+
+    //Cursor state
+    uint32_t cursor_x;
+    uint32_t cursor_y;
+    uint32_t cursor_enabled;
+    uint32_t cursor_hotspot_x;
+    uint32_t cursor_hotspot_y;
+    uint32_t cursor_data[CURSOR_SIZE * CURSOR_SIZE]; //Argb format
+    uint32_t cursor_upload_offset;
 
     //Display
     QemuConsole *console;
@@ -145,10 +183,39 @@ static uint64_t gray_gpu_reg_read(void *opaque, hwaddr addr, unsigned size)
         case REG_FB_PITCH:
             val = g->fb_pitch;
             break;
+        case REG_CURSOR_X:
+            val = g->cursor_x;
+            break;
+        case REG_CURSOR_Y:
+            val = g->cursor_y;
+            break;
+        case REG_CURSOR_ENABLE:
+            val = g->cursor_enabled;
+            break;
+        case REG_CURSOR_HOTSPOT_X:
+            val = g->cursor_hotspot_x;
+            break;
+        case REG_CURSOR_HOTSPOT_Y:
+            val = g->cursor_hotspot_y;
+            break;
+        case REG_FB_COUNT:
+            val = g->fb_count;
+            break;
+        case REG_FB_CURRENT:
+            val = g->fb_current;
+            break;
+        case REG_FB_NEXT:
+            val = g->fb_next;
+            break;
+        case REG_FLIP_PENDING:
+            val = g->flip_pending;
+            break;
+        case REG_VBLANK_COUNT:
+            val = g->vblank_count;
+            break;
         default:
             qemu_log_mask(LOG_GUEST_ERROR, "Invalid register read at 0x%lx\n", addr);
-            break;
-    }
+            break;    }
 
     return val;
 }
@@ -207,6 +274,66 @@ static void gray_gpu_reg_write(void *opaque, hwaddr addr, uint64_t val, unsigned
             g->fb_pitch = val;
             g->dirty = true;
             break;
+        case REG_CURSOR_X:
+            g->cursor_x = val;
+            g->dirty = true;
+            break;
+        case REG_CURSOR_Y:
+            g->cursor_y = val;
+            g->dirty = true;
+            break;
+        case REG_CURSOR_ENABLE:
+            g->cursor_enabled = val;
+            g->dirty = true;
+            break;
+        case REG_CURSOR_HOTSPOT_X:
+            g->cursor_hotspot_x = val;
+            break;
+        case REG_CURSOR_HOTSPOT_Y:
+            g->cursor_hotspot_y = val;
+            break;
+        case REG_CURSOR_UPLOAD:
+             if (g->cursor_upload_offset < CURSOR_SIZE * CURSOR_SIZE) {
+                g->cursor_data[g->cursor_upload_offset] = val;
+                g->cursor_upload_offset++;
+                if (g->cursor_upload_offset >= CURSOR_SIZE * CURSOR_SIZE) {
+                    g->cursor_upload_offset = 0; /* Reset for next upload */
+                    g->status |= STATUS_CURSOR_LOADED;
+                    g->dirty = true;
+                }
+            }
+            break;
+        case REG_FB_COUNT:
+            if(val <= 4){
+
+                int i;
+                uint32_t fb_size;
+
+                g->fb_count = val;
+                fb_size = g->fb_width * g->fb_height * (g->fb_bpp / 8);
+                for( i = 0; i < g->fb_count; i++){
+                    g->fb_addresses[i] = i * fb_size;
+                }
+                g->fb_current = 0;
+                g->fb_next = 0;
+                g->dirty = true;
+            }
+            break;
+        case REG_FB_NEXT:
+            if(val < g->fb_count){
+                g->fb_next = val;
+            }
+            break;
+        case REG_PAGE_FLIP:
+            if(val && g->fb_next < g->fb_count && !g->flip_pending){
+                g->flip_pending = 1;
+                g->fb_current = g->fb_next;
+                g->fb_addr = g->fb_addresses[g->fb_current];
+                g->flip_pending = 0;
+                g->vblank_count++;
+                g->dirty = true;
+            }
+            break;
         default:
             qemu_log_mask(LOG_GUEST_ERROR, "Invalid regiseter write at 0x%lx = 0x%lx\n", addr, val);
             break;
@@ -218,6 +345,80 @@ static const MemoryRegionOps gray_gpu_reg_ops = {
     .write = gray_gpu_reg_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
+
+static void init_default_cursor(GrayGPUState *g)
+{
+    memset(g->cursor_data, 0, sizeof(g->cursor_data));
+    
+    /* Simple white arrow cursor with black outline */
+    for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 10; x++) {
+            if ((x == 0 && y < 16) ||  /* Left edge */
+                (y == 0 && x < 10) ||  /* Top edge */
+                (x == y && x < 10) ||  /* Diagonal */
+                (x == 5 && y > 5 && y < 12)) { /* Stem */
+                
+                /* Black outline */
+                g->cursor_data[y * CURSOR_SIZE + x] = 0xFF000000;
+                
+                /* White fill inside */
+                if (x > 0 && y > 0 && x < 9) {
+                    g->cursor_data[y * CURSOR_SIZE + x + 1] = 0xFFFFFFFF;
+                }
+            }
+        }
+    }
+    
+    g->cursor_hotspot_x = 0;
+    g->cursor_hotspot_y = 0;
+}
+
+static void composite_cursor(GrayGPUState *g, uint32_t *fb)
+{
+    if(!g->cursor_enabled || !g->fb_enable){
+        return;
+    }
+
+    int cursor_screen_x = g->cursor_x - g->cursor_hotspot_x;
+    int cursor_screen_y = g->cursor_y - g->cursor_hotspot_y;
+
+    for(int cy = 0; cy < CURSOR_SIZE; cy++){
+        for(int cx = 0; cx < CURSOR_SIZE; cx++){
+            int screen_x = cursor_screen_x + cx;
+            int screen_y = cursor_screen_y + cy;
+
+            if(screen_x < 0 || screen_x >= (int)g->fb_width || screen_y < 0 || screen_y >= (int)g->fb_height){
+                continue;
+            }
+
+            uint32_t cursor_pixel = g->cursor_data[cy * CURSOR_SIZE + cx];
+            uint32_t alpha = (cursor_pixel >> 24) & 0xFF;
+
+            if(alpha > 0){
+                int fb_offset = screen_y * g->fb_width + screen_x;
+
+                if(alpha == 0xFF){
+                    fb[fb_offset] = cursor_pixel;
+                }else{
+                    uint32_t bg = fb[fb_offset];
+                    uint32_t bg_r = (bg >> 16) & 0xFF;
+                    uint32_t bg_g = (bg >> 8) & 0xFF;
+                    uint32_t bg_b = bg & 0xFF;
+
+                    uint32_t fg_r = (cursor_pixel >> 16) & 0xFF;
+                    uint32_t fg_g = (cursor_pixel >> 8) & 0xFF;
+                    uint32_t fg_b = cursor_pixel & 0xFF;
+                    
+                    uint32_t r_t = (fg_r * alpha + bg_r * (255 - alpha)) / 255;
+                    uint32_t g_t = (fg_g * alpha + bg_g * (255 - alpha)) / 255;
+                    uint32_t b_t = (fg_b * alpha + bg_b * (255 - alpha)) / 255;
+                    
+                    fb[fb_offset] = 0xFF000000 | (r_t << 16) | (g_t << 8) | b_t;
+                }
+            }
+        }
+    }
+}
 
 static void gray_gpu_update_display(void *opaque)
 {
@@ -232,12 +433,22 @@ static void gray_gpu_update_display(void *opaque)
     if(g->fb_width > 0 && g->fb_height > 0 && g->dirty){
         uint8_t *fb_data = g->vram_ptr + g->fb_addr;
 
-        //Create display surface from framebuffer data
+        //Create displaysimple-gpu-drv.c surface from framebuffer data
         if(g->fb_bpp == 32){
+
+            //Create a temporary buffer for compositing cursor
+            uint32_t *temp_buffer = g_malloc(g->fb_width * g->fb_height * 4);
+            memcpy(temp_buffer, fb_data, g->fb_width * g->fb_height * 4);
+
+            //Comosite cursor onto the framebuffer
+            composite_cursor(g, temp_buffer);
+
             DisplaySurface *fb_surface = qemu_create_displaysurface_from(
                     g->fb_width, g->fb_height, PIXMAN_a8r8g8b8,
-                    g->fb_pitch, fb_data);
+                    g->fb_pitch, (uint8_t*)temp_buffer);
             dpy_gfx_replace_surface(g->console, fb_surface);
+
+            g_free(temp_buffer);
         }
 
         dpy_gfx_update(g->console, 0, 0, g->fb_width, g->fb_height);
@@ -269,7 +480,22 @@ static void gray_gpu_realize(PCIDevice *pci_dev, Error **errp){
     g->fb_enable = 0;
     g->fb_addr = 0;
     g->dirty = false;
+
+    //Initialize cursor 
+    g->cursor_enabled = 0;
+    g->cursor_x = 0;
+    g->cursor_y = 0;
+    g->cursor_upload_offset = 0;
+    init_default_cursor(g);
     
+    //Initialize Mutliple framebuffer state
+    g->fb_count = 1;        //start with single buffer
+    g->fb_current = 0;
+    g->fb_next = 0;
+    g->flip_pending = 0;
+    g->vblank_count = 0;
+    g->fb_addresses[0] = 0; //first framebuffer at offset 0;
+
     memory_region_init_io(&g->registers, OBJECT(g), &gray_gpu_reg_ops, g,
             "gray-gpu-registers", GRAY_GPU_REG_SIZE);
     g->vram_ptr = g_malloc0(GRAY_GPU_VRAM_SIZE);

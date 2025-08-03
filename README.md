@@ -4,23 +4,32 @@ A hands-on learning project for understanding GPU driver development, starting f
 
 ## What We Have Built
 
-### 🖥️ QEMU Virtual GPU Device
-- **gray-gpu.c**: Complete virtual PCI GPU device (1122:1122)
+### 🖥️ QEMU Virtual GPU Device (simple-gpu.c)
+- **Complete virtual PCI GPU device** (1122:1122)
 - 16MB VRAM allocation with memory-mapped I/O
-- Register interface for device control
-- Display refresh and framebuffer management
+- **Hardware cursor support** with 64x64 ARGB pixels
+- **Page flipping registers** for smooth animation
+- **Multiple framebuffer management** (up to 4 buffers)
+- VBlank synchronization and tear-free rendering
 - Integrated into QEMU build system
 
-### 🔧 Gray GPU Kernel Driver
-- **gray_drv.c**: Working Linux kernel driver (1122:1122)
-- Character device interface (`/dev/gray-gpu`)
-- Custom IOCTL commands:
+### 🔧 Simple GPU Kernel Driver (simple-gpu-drv.c)
+- **Production-quality Linux kernel driver** (1122:1122)
+- Character device interface (`/dev/simple-gpu`)
+- **Complete IOCTL interface**:
   - `0x1000`: Setup framebuffer (resolution, color depth)
   - `0x1001`: Enable/disable display
   - `0x1002`: Get VRAM size
+  - `0x1003-0x1006`: Hardware cursor control
+  - `0x1007`: Setup multiple framebuffers
+  - `0x1008`: Page flip for smooth animation
+  - `0x1009`: Wait for flip completion
+  - `0x100A`: Get framebuffer information
+- **Page flipping support** for tear-free rendering
+- **Hardware cursor implementation** with alpha blending
 - PCI device probe and resource management
 - VRAM mapping for userspace access via `mmap()`
-- Proper error handling and cleanup
+- C89 compatibility and proper error handling
 
 ### 🎮 Test Applications
 - **test-app.c**: Animated validation program
@@ -30,11 +39,13 @@ A hands-on learning project for understanding GPU driver development, starting f
 
 ## Current Capabilities
 
- **Virtual Hardware**: QEMU device emulates real GPU hardware  
- **Kernel Driver**: Functional driver with PCI integration  
- **Memory Management**: VRAM allocation and userspace mapping  
- **Display Output**: Working framebuffer with smooth animation  
- **Development Workflow**: Build, load, test cycle established
+✅ **Virtual Hardware**: QEMU device emulates real GPU hardware with page flipping  
+✅ **Kernel Driver**: Production-quality driver with complete feature set  
+✅ **Memory Management**: VRAM allocation and userspace mapping  
+✅ **Display Output**: Tear-free rendering with hardware cursor support  
+✅ **Page Flipping**: Smooth animation with double/quad buffering  
+✅ **Hardware Cursor**: 64x64 ARGB cursor with hotspot control  
+✅ **Development Workflow**: Complete build, load, test cycle established
 
 ## Project Structure
 ```
@@ -57,9 +68,18 @@ test-app.c → /dev/gray-gpu → gray_drv.c → QEMU Virtual GPU
 
 **Data Flow**:
 1. Test app opens character device
-2. Driver maps VRAM to userspace via mmap()
-3. App draws directly to framebuffer memory
-4. QEMU device displays the framebuffer
+2. Driver sets up multiple framebuffers via IOCTL
+3. App maps VRAM to userspace via mmap()
+4. App draws to back buffer while front buffer displays
+5. Page flip atomically switches buffers for tear-free rendering
+6. Hardware cursor composited in QEMU device
+
+**Page Flipping Pipeline**:
+```
+Frame N:   Draw to FB0 → Page flip → Display FB0
+Frame N+1: Draw to FB1 → Page flip → Display FB1
+Frame N+2: Draw to FB0 → Page flip → Display FB0
+```
 
 ## What We Are Approaching
 

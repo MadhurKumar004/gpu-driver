@@ -26,6 +26,18 @@
 #define REG_FB_BPP          0x18
 #define REG_FB_ENABLE       0x1C
 #define REG_FB_PITCH        0x20
+#define REG_CURSOR_X        0x24
+#define REG_CURSOR_Y        0x28
+#define REG_CURSOR_ENABLE   0x2C
+#define REG_CURSOR_HOTSPOT_X 0x30
+#define REG_CURSOR_HOTSPOT_Y 0x34
+#define REG_CURSOR_UPLOAD   0x38
+#define REG_FB_COUNT        0x3C   
+#define REG_FB_CURRENT      0x40  
+#define REG_FB_NEXT         0x44 
+#define REG_PAGE_FLIP       0x48  
+#define REG_FLIP_PENDING    0x4C  
+#define REG_VBLANK_COUNT    0x50 
 
 //Control register bits
 #define CTRL_RESET	(1<<0)
@@ -34,6 +46,7 @@
 //Status register bits
 #define STATUS_READY	(1<<0)
 #define STATUS_VBLANK	(1<<1)
+#define STATUS_CURSOR_LOADED (1 << 2)
 
 //Character device
 #define GRAY_GPU_MINOR		0
@@ -51,6 +64,21 @@ struct gray_gpu_device {
 	uint32_t fb_bpp;
 	uint32_t fb_pitch;
 	uint32_t fb_size;
+ 
+	/* Cursor info */
+	uint32_t cursor_x;
+	uint32_t cursor_y;
+	uint32_t cursor_enabled;
+	uint32_t cursor_hotspot_x;
+	uint32_t cursor_hotspot_y;
+
+	//Multiple Framebuffer state
+	uint32_t fb_count;
+	uint32_t fb_current;
+	uint32_t fb_next;
+	uint32_t flip_pending;
+	uint32_t vblank_count;
+	uint32_t fb_addresses[4];
 
 	//Character device
 	struct cdev cdev;
@@ -103,6 +131,163 @@ static void gray_gpu_enable_display(struct gray_gpu_device *gpu, bool enable)
 	dev_info(&gpu->pdev->dev, "Display %s\n", enable? "enabled" : "disabled");
 }
 
+static void gray_gpu_set_cursor_position(struct gray_gpu_device *gpu, uint32_t x, uint32_t y)
+{
+	gpu->cursor_x = x;
+	gpu->cursor_y = y;
+	gray_gpu_write_reg(gpu, REG_CURSOR_X, x);
+	gray_gpu_write_reg(gpu, REG_CURSOR_Y, y);
+}
+
+static void gray_gpu_enable_cursor(struct gray_gpu_device *gpu, bool enable)
+{
+	gpu->cursor_enabled = enable ? 1 : 0;
+	gray_gpu_write_reg(gpu, REG_CURSOR_ENABLE, gpu->cursor_enabled);
+	dev_info(&gpu->pdev->dev, "Cursor %s\n", enable ? "enabled" : "disabled");
+}
+
+static void gray_gpu_set_cursor_hotspot(struct gray_gpu_device *gpu, uint32_t x, uint32_t y)
+{
+	gpu->cursor_hotspot_x = x;
+	gpu->cursor_hotspot_y = y;
+	gray_gpu_write_reg(gpu, REG_CURSOR_HOTSPOT_X, x);
+	gray_gpu_write_reg(gpu, REG_CURSOR_HOTSPOT_Y, y);
+}
+
+static int gray_gpu_upload_cursor(struct gray_gpu_device *gpu, const uint32_t *cursor_data, size_t size)
+{
+	size_t i;
+
+	if(size > 64 * 64){
+		dev_err(&gpu->pdev->dev, "Cursor data too large (max 64x64 pixels)\n");
+		return -EINVAL;
+	}
+
+	/* Upload cursor data pixel by pixel */
+	for (i = 0; i < size; i++) {
+		gray_gpu_write_reg(gpu, REG_CURSOR_UPLOAD, cursor_data[i]);
+	}
+	return 0;
+}
+
+static int gray_gpu_setup_multi_framebuffer(struct gray_gpu_device *gpu, uint32_t fb_count, uint32_t width, uint32_t height, uint32_t bpp)
+{
+	uint32_t fb_size;
+	if(fb_count > 4){
+		dev_err(&gpu->pdev->dev, "Maximum 4 framebuffer supported\n");
+		return -EINVAL;
+	}
+
+	fb_size = width * height * (bpp / 8);
+
+	if(fb_size * fb_count > gpu->vram_size){
+		dev_err(&gpu->pdev->dev, "Not enough VRAM for %d framebuffer\n", fb_count);
+		return -EINVAL;
+	}
+
+	gpu->fb_width = width;
+	gpu->fb_height = height;
+	gpu->fb_bpp = bpp;
+	gpu->fb_size = fb_size;
+	gpu->fb_count = fb_count;
+	gpu->fb_current = 0;
+	gpu->fb_next = 0;
+	gpu->flip_pending = 0;
+
+	{
+		int i;
+		for( i = 0; i < fb_count; i++){
+			gpu->fb_addresses[i] = i * fb_size;
+		}
+	}
+    
+    /* Configure hardware */
+	gray_gpu_write_reg(gpu, REG_FB_WIDTH, width);
+	gray_gpu_write_reg(gpu, REG_FB_HEIGHT, height);
+	gray_gpu_write_reg(gpu, REG_FB_BPP, bpp);
+	gray_gpu_write_reg(gpu, REG_FB_PITCH, gpu->fb_pitch);
+	gray_gpu_write_reg(gpu, REG_FB_COUNT, fb_count);
+	gray_gpu_write_reg(gpu, REG_FB_ADDR, gpu->fb_addresses[0]); /* Start with first buffer */
+    
+	 dev_info(&gpu->pdev->dev, "Setup %d framebuffers: %dx%d@%dbpp, each %d bytes\n",
+		fb_count, width, height, bpp, fb_size);
+             
+	return 0;
+}
+
+static int gray_gpu_page_flip(struct gray_gpu_device *gpu, uint32_t fb_index, uint32_t wait_vblank)
+{
+	if (fb_index >= gpu->fb_count) {
+		dev_err(&gpu->pdev->dev, "Invalid framebuffer index: %d\n", fb_index);
+		return -EINVAL;
+	}
+    
+	 if (gpu->flip_pending) {
+		dev_warn(&gpu->pdev->dev, "Page flip already pending\n");
+		return -EBUSY;
+	}
+    
+	/* Set next framebuffer */
+	gpu->fb_next = fb_index;
+	gray_gpu_write_reg(gpu, REG_FB_NEXT, fb_index);
+    
+	/* Trigger page flip */
+	 gray_gpu_write_reg(gpu, REG_PAGE_FLIP, 1);
+    
+	/* Check if flip completed immediately */
+	gpu->flip_pending = gray_gpu_read_reg(gpu, REG_FLIP_PENDING);
+	 if (!gpu->flip_pending) {
+		gpu->fb_current = fb_index;
+		gpu->vblank_count = gray_gpu_read_reg(gpu, REG_VBLANK_COUNT);
+	}
+    
+	dev_dbg(&gpu->pdev->dev, "Page flip to framebuffer %d %s\n", 
+		fb_index, gpu->flip_pending ? "pending" : "completed");
+            
+	return 0;
+}
+
+static int gray_gpu_wait_flip(struct gray_gpu_device *gpu)
+{
+	int timeout = 100; /* 100ms timeout */
+    
+	while (gpu->flip_pending && timeout > 0) {
+		gpu->flip_pending = gray_gpu_read_reg(gpu, REG_FLIP_PENDING);
+		if (!gpu->flip_pending) {
+			gpu->fb_current = gray_gpu_read_reg(gpu, REG_FB_CURRENT);
+			gpu->vblank_count = gray_gpu_read_reg(gpu, REG_VBLANK_COUNT);
+			break;
+		}
+		msleep(1);
+		timeout--;
+	}
+    
+	if (gpu->flip_pending) {
+		dev_err(&gpu->pdev->dev, "Page flip timeout\n");
+		return -ETIMEDOUT;
+	}
+    
+	return 0;
+}
+
+static void gray_gpu_get_fb_info(struct gray_gpu_device *gpu, void *info_struct)
+{
+	struct {
+		uint32_t fb_count;
+		uint32_t current_fb;
+		uint32_t fb_size;
+		uint32_t fb_offsets[4];
+	} *fb_info = info_struct;
+	    
+	fb_info->fb_count = gpu->fb_count;
+	fb_info->current_fb = gpu->fb_current;
+	fb_info->fb_size = gpu->fb_size;
+	    
+	for (int i = 0; i < 4; i++) {
+		fb_info->fb_offsets[i] = (i < gpu->fb_count) ? gpu->fb_addresses[i] : 0;
+	}
+}
+
 static int gray_gpu_open(struct inode *inode, struct file *file)
 {
 	file->private_data = gray_gpu_dev;
@@ -133,6 +318,100 @@ static long gray_gpu_ioctl(struct file *file, unsigned int cmd, unsigned long ar
         return 0;
     case 0x1002: /* Get VRAM size */
         return put_user(gpu->vram_size, (uint32_t __user *)arg);
+    case 0x1003: //Set cursor position
+	{
+		uint32_t params[2];
+		if(copy_from_user(params, (void __user *)arg, sizeof(params))){
+			return -EFAULT;
+		}
+		gray_gpu_set_cursor_position(gpu, params[0], params[1]);
+		return 0;
+	}
+    case 0x1004: //Enable/Disable cursor 
+	gray_gpu_enable_cursor(gpu, arg != 0);
+	return 0;
+    case 0x1005: //Set cursor hotspot
+	{
+		uint32_t params[2];
+		if(copy_from_user(params, (void __user *)arg, sizeof(params))){
+			return -EFAULT;
+		}
+		gray_gpu_set_cursor_hotspot(gpu, params[0], params[1]);
+		return 0;
+	}
+    case 0x1006:
+	{
+		struct{
+			uint32_t *data;
+			size_t size;
+		} cursor_upload;
+		uint32_t *cursor_data;
+		int ret;
+
+		if(copy_from_user(&cursor_upload, (void __user *)arg, sizeof(cursor_upload))){
+			return -EFAULT;
+		}
+
+		if(cursor_upload.size > 64 * 64){
+			return -EINVAL;
+		}
+
+		cursor_data = kmalloc(cursor_upload.size * sizeof(uint32_t), GFP_KERNEL);
+		if(!cursor_data){
+			return -ENOMEM;
+		}
+
+		if(copy_from_user(cursor_data, cursor_upload.data, cursor_upload.size * sizeof(uint32_t))){
+			kfree(cursor_data);
+			return -EFAULT;
+		}
+
+		ret = gray_gpu_upload_cursor(gpu, cursor_data, cursor_upload.size);
+		kfree(cursor_data);
+		return ret;
+	}
+    case 0x1007: //Setup Multiple framebuffer
+	{
+		struct {
+			uint32_t fb_count;
+			uint32_t width;
+			uint32_t height;
+			uint32_t bpp;
+		} multi_setup;
+		if(copy_from_user(&multi_setup, (void __user *)arg, sizeof(multi_setup))){
+			return -EFAULT;
+		}
+		return gray_gpu_setup_multi_framebuffer(gpu, multi_setup.fb_count, multi_setup.width,multi_setup.height, multi_setup.bpp);
+	}
+    case 0x1008:
+	{
+		struct {
+			uint32_t fb_index;
+			uint32_t wait_vblank;
+		} flip_req;
+		if(copy_from_user(&flip_req, (void __user *)arg, sizeof(flip_req))){
+			return -EFAULT;
+		}
+		return gray_gpu_page_flip(gpu, flip_req.fb_index, flip_req.wait_vblank);
+	}
+    case 0x1009: //wait fror flip completion
+	return gray_gpu_wait_flip(gpu);
+    case 0x100A: //Get framebuffer into
+	{
+		struct {
+			uint32_t fb_count;
+			uint32_t current_fb;
+			uint32_t fb_size;
+			uint32_t fb_offset[4];
+		} fb_info;
+
+		gray_gpu_get_fb_info(gpu, &fb_info);
+
+		if(copy_from_user((void __user *)arg, &fb_info, sizeof(fb_info))){
+			return -EFAULT;
+		}
+		return 0;
+	}
     default:
         return -ENOTTY;
     }
@@ -289,6 +568,23 @@ static int gray_gpu_pci_probe(struct pci_dev *pdev, const struct pci_device_id *
 	if(ret){
 		goto err_device_destroy;
 	}
+
+	gpu->cursor_x = 0;
+	gpu->cursor_y = 0;
+	gpu->cursor_enabled = 0;
+	gpu->cursor_hotspot_x = 0;
+	gpu->cursor_hotspot_y = 0;
+
+	gray_gpu_set_cursor_position(gpu, 0, 0);
+	gray_gpu_set_cursor_hotspot(gpu, 0, 0);
+	gray_gpu_enable_cursor(gpu, false);
+
+	gpu->fb_count = 1;
+	gpu->fb_current = 0;
+	gpu->fb_next = 0;
+	gpu->flip_pending = 0;
+	gpu->vblank_count = 0;
+	gpu->fb_addresses[0] = 0; 
 
 	dev_info(&pdev->dev, "Gray gpu loaded successfully\n");
 	dev_info(&pdev->dev, "Character device: /dev/%s\n", GRAY_GPU_NAME);
